@@ -48,6 +48,16 @@ public class PopupUI extends JDialog {
         this(mainUI, manager, null);
     }
 
+    /** 목표 날짜가 미리 채워진 상태로 여는 생성자 (달력에서 날짜를 더블클릭했을 때) */
+    public PopupUI(MainUI mainUI, ScheduleManager manager, Schedule target, String initialDate) {
+        this(mainUI, manager, target);
+        if (initialDate != null && dateInput != null) {
+            dateInput.setText(initialDate);
+        }
+    }
+
+
+    
     /** @param editTarget 변경할 일정 (null 이면 새 일정 추가) */
     public PopupUI(MainUI mainUI, ScheduleManager manager, Schedule editTarget) {
         super(mainUI, editTarget == null ? "Plan:Null - 일정 추가" : "Plan:Null - 일정 변경", true);

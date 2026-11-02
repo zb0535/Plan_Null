@@ -8,6 +8,8 @@ import javax.swing.border.LineBorder;
 import javax.swing.plaf.FontUIResource;
 import java.awt.*;
 import java.awt.event.ActionEvent;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -20,11 +22,13 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,8 +37,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 사용자에게 보여지는 주 화면(화면 A)을 구성하는 JFrame 클래스
  *
  * <ul>
- *   <li>상단: 전체 일정 대비 완료 비율(%) + 막대그래프</li>
- *   <li>중앙: D-Day 순 일정 목록 또는 월별 달력 (상단 버튼으로 전환)</li>
+ *   <li>상단: 전체 일정 대비 완료 비율(%) + 막대그래프 + [목록]/[달력] 전환</li>
+ *   <li>중앙: D-Day 순 일정 목록 또는 월별 달력
+ *       (달력: 오늘 강조, 일정 클릭 선택, 넘치는 일정은 "+N개 더", 날짜 더블클릭으로 그날 일정 추가)</li>
  *   <li>하단: [일정 추가] [일정 변경] [일정 삭제] (삭제 전에는 확인 팝업)</li>
  *   <li>알림: 30초마다 알림 시각이 된 일정을 확인해 소리와 팝업으로 알려 준다 (프로그램이 켜져 있는 동안)</li>
  * </ul>
@@ -47,8 +52,10 @@ public class MainUI extends JFrame {
     private static final Color PEACH_LIGHT = new Color(251, 229, 214);
     private static final Color PEACH_SELECTED = new Color(244, 176, 132);
     private static final Color NAVY = new Color(44, 62, 94);
+    private static final Color SATURDAY = new Color(50, 100, 180);   // 토요일 글자색
+    private static final Color SUNDAY = new Color(200, 60, 60);      // 일요일 글자색
     private static final int CHECK_AREA_WIDTH = 46;         // 행 왼쪽 이 폭 안을 누르면 '완료 체크' 로 본다
-    private static final int REMINDER_CHECK_MS = 30_000;    // 알림 시각을 확인하는 주기
+    private static final int REMINDER_CHECK_MS = 30_000;    // 알림 시각·날짜 변경을 확인하는 주기
 
     private final ScheduleManager manager;
     private final JProgressBar progressBar = new JProgressBar(0, 100);
@@ -59,10 +66,16 @@ public class MainUI extends JFrame {
     private final AtomicBoolean saveErrorShown = new AtomicBoolean(false);
     private final JPanel calendarPanel = new JPanel(new BorderLayout(0, 6));
     private final JLabel monthLabel = new JLabel("", SwingConstants.CENTER);
+    private final List<CalendarEntry> calendarEntries = new ArrayList<>();   // 달력에 그려진 일정 라벨들 (선택 표시용)
+    private JPanel calendarBody;                            // 현재 그려진 달력 본문 (요일 줄 + 날짜 칸)
+    private int calendarMaxLines = 2;                       // 날짜 칸 하나에 보여 줄 수 있는 일정 줄 수
     private YearMonth displayedMonth = YearMonth.now();
     private boolean calendarView;
     private JList<Schedule> scheduleList;
     private javax.swing.Timer reminderTimer;
+    private LocalDate lastCheckedDate = LocalDate.now();    // 자정이 지났는지 확인하기 위한 기준 날짜
+    private JDialog reminderDialog;                         // 지금 떠 있는 알림 창 (없으면 null)
+    private JTextArea reminderBody;
 
     public MainUI() {
         this(new ScheduleManager());
@@ -71,7 +84,7 @@ public class MainUI extends JFrame {
     public MainUI(ScheduleManager manager) {
         this.manager = manager;
         setTitle("Plan:Null - Personal Schedule Manager");
-        setSize(780, 540);
+        setSize(860, 680);
         setMinimumSize(new Dimension(640, 420));
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);      // 닫을 때 저장 대기 작업을 마무리해야 하므로 직접 처리
         setLocationRelativeTo(null);                        // 화면 중앙 배치
@@ -174,8 +187,11 @@ public class MainUI extends JFrame {
 
         refreshListStatus();                                // 초기 데이터 로드
 
-        // 알림: 30초마다 알림 시각이 된 일정이 있는지 확인
-        reminderTimer = new javax.swing.Timer(REMINDER_CHECK_MS, e -> checkReminders());
+        // 30초마다: 날짜가 바뀌었는지 확인(D-Day 갱신) + 알림 시각이 된 일정이 있는지 확인
+        reminderTimer = new javax.swing.Timer(REMINDER_CHECK_MS, e -> {
+            checkDateChange();
+            checkReminders();
+        });
         reminderTimer.setInitialDelay(1000);
         reminderTimer.start();
     }
@@ -210,10 +226,23 @@ public class MainUI extends JFrame {
         }
     }
 
+    // ===== 달력 =====
+
+    /** 달력 라벨과 일정 ID 를 묶어 두는 작은 보관용 클래스 (선택 표시에 쓴다) */
+    private static class CalendarEntry {
+        final String scheduleId;
+        final JLabel label;
+
+        CalendarEntry(String scheduleId, JLabel label) {
+            this.scheduleId = scheduleId;
+            this.label = label;
+        }
+    }
+
     private JPanel createCalendarPanel() {
-        JPanel header = new JPanel(new BorderLayout());
-        JButton previous = styledButton("<");
-        JButton next = styledButton(">");
+        JButton previous = styledButton("<", 14);
+        JButton next = styledButton(">", 14);
+        JButton today = styledButton("오늘", 14);
         previous.addActionListener(e -> {
             displayedMonth = displayedMonth.minusMonths(1);
             refreshCalendar();
@@ -222,84 +251,287 @@ public class MainUI extends JFrame {
             displayedMonth = displayedMonth.plusMonths(1);
             refreshCalendar();
         });
+        today.addActionListener(e -> {
+            displayedMonth = YearMonth.now();
+            refreshCalendar();
+        });
         monthLabel.setFont(monthLabel.getFont().deriveFont(Font.BOLD, 18f));
-        header.add(previous, BorderLayout.WEST);
+        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        right.add(today);
+        right.add(next);
+        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        left.add(previous);
+        JPanel header = new JPanel(new BorderLayout());
+        header.add(left, BorderLayout.WEST);
         header.add(monthLabel, BorderLayout.CENTER);
-        header.add(next, BorderLayout.EAST);
+        header.add(right, BorderLayout.EAST);
         calendarPanel.add(header, BorderLayout.NORTH);
+
+        // 창 크기에 따라 날짜 칸에 보여 줄 일정 줄 수를 다시 계산한다
+        calendarPanel.addComponentListener(new ComponentAdapter() {
+            @Override
+            public void componentResized(ComponentEvent e) {
+                adjustCalendarLines();
+            }
+
+            @Override
+            public void componentShown(ComponentEvent e) {
+                adjustCalendarLines();
+            }
+        });
         refreshCalendar();
         return calendarPanel;
     }
 
+    /** 달력 높이에서 날짜 칸 한 개에 들어가는 일정 줄 수를 계산해, 달라졌으면 달력을 다시 그린다. */
+    private void adjustCalendarLines() {
+        int height = calendarPanel.getHeight();
+        if (height <= 0) {
+            return;
+        }
+        int rowHeight = (height - 80) / 6;                  // 위쪽 이동 줄·요일 줄을 빼고 6주로 나눈 높이
+        int lines = Math.max(2, (rowHeight - 22) / 15);     // 날짜 숫자 줄(22px)을 빼고 일정 한 줄(15px)씩
+        if (lines != calendarMaxLines) {
+            calendarMaxLines = lines;
+            refreshCalendar();
+        }
+    }
+
     private void refreshCalendar() {
-        if (calendarPanel.getComponentCount() > 1) {
-            calendarPanel.remove(1);
+        if (calendarBody != null) {
+            calendarPanel.remove(calendarBody);
         }
+        calendarEntries.clear();
         monthLabel.setText(displayedMonth.format(DateTimeFormatter.ofPattern("yyyy년 M월")));
-        JPanel grid = new JPanel(new GridLayout(7, 7, 3, 3));
-        for (String day : new String[]{"월", "화", "수", "목", "금", "토", "일"}) {
-            JLabel header = new JLabel(day, SwingConstants.CENTER);
+
+        // 요일 줄
+        JPanel weekdays = new JPanel(new GridLayout(1, 7, 3, 3));
+        String[] names = {"월", "화", "수", "목", "금", "토", "일"};
+        for (int i = 0; i < 7; i++) {
+            JLabel header = new JLabel(names[i], SwingConstants.CENTER);
             header.setFont(header.getFont().deriveFont(Font.BOLD));
-            header.setForeground(NAVY);
-            grid.add(header);
+            header.setForeground(i == 5 ? SATURDAY : (i == 6 ? SUNDAY : NAVY));
+            weekdays.add(header);
         }
-        LocalDate first = displayedMonth.atDay(1);
-        int leading = first.getDayOfWeek().getValue() - 1;
-        List<Schedule> schedules = manager.sortSchedulesByDDay();
+
+        // 날짜별로 일정을 미리 묶어 둔다 (D-Day 순서 유지)
+        Map<String, List<Schedule>> byDate = new HashMap<>();
+        for (Schedule s : manager.sortSchedulesByDDay()) {
+            List<Schedule> day = byDate.get(s.getTargetDate());
+            if (day == null) {
+                day = new ArrayList<>();
+                byDate.put(s.getTargetDate(), day);
+            }
+            day.add(s);
+        }
+
+        JPanel grid = new JPanel(new GridLayout(6, 7, 3, 3));
+        LocalDate today = LocalDate.now();
+        int leading = displayedMonth.atDay(1).getDayOfWeek().getValue() - 1;
         for (int i = 0; i < 42; i++) {
             int dayNumber = i - leading + 1;
+            int column = i % 7;
             JPanel dayCell = new JPanel();
             dayCell.setLayout(new BoxLayout(dayCell, BoxLayout.Y_AXIS));
-            dayCell.setBorder(new LineBorder(NAVY, 1));
-            dayCell.setBackground(Color.WHITE);
             if (dayNumber < 1 || dayNumber > displayedMonth.lengthOfMonth()) {
+                dayCell.setBorder(new LineBorder(NAVY, 1));
                 dayCell.setBackground(new Color(238, 238, 238));
                 grid.add(dayCell);
                 continue;
             }
             LocalDate date = displayedMonth.atDay(dayNumber);
-            JLabel dayLabel = new JLabel(String.valueOf(dayNumber));
-            dayLabel.setBorder(new EmptyBorder(2, 4, 2, 2));
-            dayCell.add(dayLabel);
-            for (Schedule schedule : schedules) {
-                if (!date.toString().equals(schedule.getTargetDate())) {
-                    continue;
-                }
-                JLabel scheduleLabel = new JLabel((schedule.isCompleted() ? "✓ " : "") + schedule.getTitle());
-                scheduleLabel.setToolTipText(tooltipFor(schedule));
-                scheduleLabel.setFont(scheduleLabel.getFont().deriveFont(schedule.isCompleted() ? Font.PLAIN : Font.BOLD, 11f));
-                scheduleLabel.setForeground(schedule.isCompleted() ? Color.GRAY : NAVY);
-                scheduleLabel.setBorder(new EmptyBorder(1, 4, 1, 2));
-                scheduleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-                scheduleLabel.addMouseListener(new MouseAdapter() {
-                    @Override
-                    public void mouseClicked(MouseEvent e) {
-                        if (SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 2) {
-                            selectSchedule(schedule);
-                            editSelected();
-                        }
+            boolean isToday = date.equals(today);
+            dayCell.setBorder(new LineBorder(NAVY, isToday ? 2 : 1));
+            dayCell.setBackground(isToday ? PEACH_LIGHT : Color.WHITE);
+            dayCell.setToolTipText("더블클릭: " + date + " 에 일정 추가");
+            dayCell.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 2) {
+                        openPopup(null, date.toString());   // 날짜가 채워진 상태로 일정 추가 팝업을 연다
                     }
-                });
-                dayCell.add(scheduleLabel);
+                }
+            });
+
+            JLabel dayLabel = new JLabel(isToday ? dayNumber + " (오늘)" : String.valueOf(dayNumber));
+            dayLabel.setFont(dayLabel.getFont().deriveFont(isToday ? Font.BOLD : Font.PLAIN));
+            dayLabel.setForeground(column == 6 ? SUNDAY : (column == 5 ? SATURDAY : Color.BLACK));
+            dayLabel.setBorder(new EmptyBorder(2, 4, 2, 2));
+            dayLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            dayCell.add(dayLabel);
+
+            List<Schedule> daySchedules = byDate.get(date.toString());
+            if (daySchedules != null) {
+                // 칸에 다 들어가면 모두 보이고, 넘치면 마지막 줄을 "+N개 더" 로 쓴다
+                int visible = daySchedules.size() <= calendarMaxLines
+                        ? daySchedules.size() : Math.max(1, calendarMaxLines - 1);
+                for (int k = 0; k < visible; k++) {
+                    dayCell.add(createScheduleLabel(daySchedules.get(k)));
+                }
+                if (daySchedules.size() > visible) {
+                    dayCell.add(createMoreLabel(date, daySchedules, daySchedules.size() - visible));
+                }
             }
             grid.add(dayCell);
         }
-        calendarPanel.add(grid, BorderLayout.CENTER);
+
+        calendarBody = new JPanel(new BorderLayout(0, 3));
+        calendarBody.add(weekdays, BorderLayout.NORTH);
+        calendarBody.add(grid, BorderLayout.CENTER);
+        calendarPanel.add(calendarBody, BorderLayout.CENTER);
+        applyCalendarSelection();
         calendarPanel.revalidate();
         calendarPanel.repaint();
     }
 
-    private void selectSchedule(Schedule schedule) {
-        int index = listModel.indexOf(schedule);
-        if (index >= 0) {
-            scheduleList.setSelectedIndex(index);
+    /** 달력 안의 일정 한 줄. 한 번 클릭하면 선택, 더블클릭하면 변경 창이 열린다. */
+    private JLabel createScheduleLabel(Schedule schedule) {
+        JLabel label = new JLabel((schedule.isCompleted() ? "✓ " : "") + schedule.getTitle());
+        label.setToolTipText(tooltipFor(schedule));
+        label.setFont(label.getFont().deriveFont(schedule.isCompleted() ? Font.PLAIN : Font.BOLD, 11f));
+        label.setForeground(schedule.isCompleted() ? Color.GRAY : NAVY);
+        label.setBorder(new EmptyBorder(1, 4, 1, 2));
+        label.setAlignmentX(Component.LEFT_ALIGNMENT);
+        label.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    selectSchedule(schedule);               // 한 번 클릭: 선택 (삭제·변경 버튼 대상)
+                    if (e.getClickCount() == 2) {
+                        editSelected();                     // 더블클릭: 일정 변경
+                    }
+                }
+            }
+        });
+        calendarEntries.add(new CalendarEntry(schedule.getScheduleID(), label));
+        return label;
+    }
+
+    /** "+N개 더" 라벨. 누르면 그날 일정 전체를 목록으로 보여 준다. */
+    private JLabel createMoreLabel(LocalDate date, List<Schedule> daySchedules, int remaining) {
+        JLabel more = new JLabel("+" + remaining + "개 더");
+        more.setFont(more.getFont().deriveFont(Font.BOLD, 11f));
+        more.setForeground(SATURDAY);
+        more.setBorder(new EmptyBorder(1, 4, 1, 2));
+        more.setAlignmentX(Component.LEFT_ALIGNMENT);
+        more.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        more.setToolTipText("눌러서 " + date + " 일정 전체 보기");
+        more.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    showDayDialog(date, daySchedules);
+                }
+            }
+        });
+        return more;
+    }
+
+    /** 선택된 일정의 달력 라벨만 강조해서 보여 준다. (달력을 다시 그리지 않고 색만 바꾼다) */
+    private void applyCalendarSelection() {
+        Schedule selected = scheduleList == null ? null : scheduleList.getSelectedValue();
+        String id = selected == null ? null : selected.getScheduleID();
+        for (CalendarEntry entry : calendarEntries) {
+            boolean on = entry.scheduleId.equals(id);
+            entry.label.setOpaque(on);
+            entry.label.setBackground(PEACH_SELECTED);
+            entry.label.repaint();
         }
+    }
+
+    /** 하루치 일정을 전부 보여 주는 창. 일정 변경·그날 일정 추가를 할 수 있다. */
+    private void showDayDialog(LocalDate date, List<Schedule> daySchedules) {
+        DefaultListModel<Schedule> model = new DefaultListModel<>();
+        for (Schedule s : daySchedules) {
+            model.addElement(s);
+        }
+        JList<Schedule> dayList = new JList<>(model);
+        dayList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        dayList.setCellRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                          boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (value instanceof Schedule) {
+                    Schedule s = (Schedule) value;
+                    setText((s.isCompleted() ? "✓ " : "") + summary(s));
+                    setBorder(new EmptyBorder(4, 8, 4, 8));
+                }
+                return this;
+            }
+        });
+        dayList.setSelectedIndex(0);
+        JScrollPane dayScroll = new JScrollPane(dayList);
+        dayScroll.setPreferredSize(new Dimension(520, 220));
+
+        JDialog dialog = new JDialog(this,
+                date.format(DateTimeFormatter.ofPattern("M월 d일 (E)", Locale.KOREAN)) + " 일정", true);
+        Runnable edit = () -> {
+            Schedule s = dayList.getSelectedValue();
+            if (s == null) {
+                return;
+            }
+            dialog.dispose();
+            selectSchedule(s);
+            SwingUtilities.invokeLater(this::editSelected);
+        };
+        dayList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 2) {
+                    edit.run();
+                }
+            }
+        });
+
+        JButton editBtn = new JButton("일정 변경");
+        JButton addBtn = new JButton("이 날 일정 추가");
+        JButton closeBtn = new JButton("닫기");
+        editBtn.addActionListener(e -> edit.run());
+        addBtn.addActionListener(e -> {
+            dialog.dispose();
+            SwingUtilities.invokeLater(() -> openPopup(null, date.toString()));
+        });
+        closeBtn.addActionListener(e -> dialog.dispose());
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 8));
+        buttons.add(editBtn);
+        buttons.add(addBtn);
+        buttons.add(closeBtn);
+
+        JPanel content = new JPanel(new BorderLayout(0, 6));
+        content.setBorder(new EmptyBorder(12, 14, 4, 14));
+        content.add(dayScroll, BorderLayout.CENTER);
+        content.add(buttons, BorderLayout.SOUTH);
+        dialog.setContentPane(content);
+        dialog.getRootPane().setDefaultButton(editBtn);
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
+    /** 일정 ID 로 목록에서 같은 일정을 찾아 선택한다. (달력 라벨 강조도 함께 갱신) */
+    private void selectSchedule(Schedule schedule) {
+        for (int i = 0; i < listModel.size(); i++) {
+            if (listModel.get(i).getScheduleID().equals(schedule.getScheduleID())) {
+                scheduleList.setSelectedIndex(i);
+                break;
+            }
+        }
+        applyCalendarSelection();
     }
 
     // ===== 동작 =====
 
     private void openPopup(Schedule target) {
-        new PopupUI(this, manager, target).showPopup();      // 화면 중앙에 모달 팝업(화면 B)
+        openPopup(target, null);
+    }
+
+    /** 일정 추가·변경 팝업(화면 B)을 연다. initialDate 가 있으면 목표 날짜가 미리 채워진다. */
+    private void openPopup(Schedule target, String initialDate) {
+        PopupUI popup = initialDate == null
+                ? new PopupUI(this, manager, target)
+                : new PopupUI(this, manager, target, initialDate);
+        popup.showPopup();                                   // 화면 중앙에 모달 팝업(화면 B)
     }
 
     private void editSelected() {
@@ -376,7 +608,16 @@ public class MainUI extends JFrame {
         System.exit(0);
     }
 
-    // ===== 알림 =====
+    // ===== 날짜 변경 · 알림 =====
+
+    /** 자정이 지나 날짜가 바뀌었으면 D-Day·달력의 '오늘' 표시를 새로 그린다. */
+    private void checkDateChange() {
+        LocalDate now = LocalDate.now();
+        if (!now.equals(lastCheckedDate)) {
+            lastCheckedDate = now;
+            refreshListStatus();
+        }
+    }
 
     /** 알림 시각이 된 일정이 있으면 소리와 팝업으로 알린다. */
     private void checkReminders() {
@@ -396,11 +637,21 @@ public class MainUI extends JFrame {
               .append("    ").append(s.getTargetDate()).append(' ').append(s.getEventDateTime().toLocalTime())
               .append("  (").append(remainingText(minutes)).append(" 남음)\n");
         }
+        String text = sb.toString().trim();
         playChime();
+
+        // 이미 알림 창이 떠 있으면 새 창을 만들지 않고 그 창에 내용을 이어 붙인다
+        if (reminderDialog != null && reminderDialog.isShowing()) {
+            reminderBody.append("\n" + text);
+            reminderDialog.pack();
+            reminderDialog.setLocationRelativeTo(null);
+            reminderDialog.toFront();
+            return;
+        }
 
         JLabel head = new JLabel("곧 시작하는 일정이 있어요!");
         head.setFont(head.getFont().deriveFont(Font.BOLD, 17f));
-        JTextArea body = new JTextArea(sb.toString().trim());
+        JTextArea body = new JTextArea(text);
         body.setEditable(false);
         body.setOpaque(false);
         JButton ok = new JButton("확인");
@@ -415,9 +666,21 @@ public class MainUI extends JFrame {
         // 주 창이 최소화돼 있어도 보이도록 소유자 없이, 항상 위에 뜨는 창으로 만든다
         JDialog dialog = new JDialog((Frame) null, "Plan:Null - 일정 알림", false);
         dialog.setAlwaysOnTop(true);
+        dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
         dialog.setContentPane(content);
         ok.addActionListener(e -> dialog.dispose());
+        dialog.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosed(WindowEvent e) {
+                if (reminderDialog == dialog) {              // 닫힌 창은 잊어버려서 다음 알림 때 새로 만든다
+                    reminderDialog = null;
+                    reminderBody = null;
+                }
+            }
+        });
         dialog.getRootPane().setDefaultButton(ok);
+        reminderDialog = dialog;
+        reminderBody = body;
         dialog.pack();
         dialog.setLocationRelativeTo(null);
         dialog.setVisible(true);
@@ -510,11 +773,17 @@ public class MainUI extends JFrame {
     }
 
     private static JButton styledButton(String text) {
+        return styledButton(text, 24);
+    }
+
+    /** sidePadding: 글자 좌우 여백(px). 달력의 작은 버튼은 좁게 쓴다. */
+    private static JButton styledButton(String text, int sidePadding) {
         JButton b = new JButton(text);
         b.setBackground(PEACH_LIGHT);
         b.setFocusPainted(false);
         b.setFont(b.getFont().deriveFont(Font.BOLD, 15f));
-        b.setBorder(new CompoundBorder(new LineBorder(NAVY, 2, true), new EmptyBorder(8, 24, 8, 24)));
+        b.setBorder(new CompoundBorder(new LineBorder(NAVY, 2, true),
+                new EmptyBorder(8, sidePadding, 8, sidePadding)));
         return b;
     }
 
@@ -558,7 +827,7 @@ public class MainUI extends JFrame {
 
         @Override
         public Dimension getPreferredSize() {
-            return new Dimension(0, super.getPreferredSize().height);   
+            return new Dimension(0, super.getPreferredSize().height);
         }
 
         @Override
